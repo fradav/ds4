@@ -11126,31 +11126,30 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
-            /* Store the post-turn visible transcript plus the live token
-             * frontier.  The next Responses request may replay only this
-             * visible surface, while the real session also contains hidden
-             * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
-                    parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, visible.ptr ? visible.ptr : "",
-                                    parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
-        } else {
-            responses_live_clear(s);
-        }
+        /* Store the post-turn visible transcript plus the live token
+         * frontier.  The next Responses request may replay only this
+         * visible surface, while the real session also contains hidden
+         * reasoning and exact sampled tool-call bytes.
+         * Preserve even on streaming errors: the tool calls were generated
+         * successfully; the error was in response delivery. */
+        char *visible_suffix =
+            build_responses_visible_assistant_suffix(&j->req,
+                parsed_content ? parsed_content : "",
+                parsed_reasoning,
+                &parsed_calls);
+        buf visible = {0};
+        buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+        buf_puts(&visible, visible_suffix ? visible_suffix : "");
+        responses_live_remember(s, visible.ptr ? visible.ptr : "",
+                                parsed_calls.len ? &parsed_calls : NULL);
+        buf_free(&visible);
+        free(visible_suffix);
     }
     if (j->req.api == API_ANTHROPIC) {
-        if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
-        {
+        if (parsed_calls.len) {
+            /* Preserve live state even on streaming errors.  The tool calls
+             * were generated successfully; the error was in response delivery.
+             * This allows continuation via tool-output-ids on retry. */
             anthropic_live_remember(s, &parsed_calls);
         } else {
             anthropic_live_clear(s);
@@ -11172,9 +11171,13 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s);
     } else if (parsed_calls.len) {
-        if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES &&
-            !strcmp(final_finish, "tool_calls"))
+        if (j->req.kind == REQ_CHAT && j->req.api != API_RESPONSES)
         {
+            /* Preserve the visible checkpoint even on streaming errors.
+             * The tool calls were successfully generated and the KV cache
+             * is valid; the error was in HTTP response, not generation.
+             * This allows the retry to continue from the tool-call boundary
+             * instead of re-prefilling the entire conversation. */
             remember_tool_visible_checkpoint(s, j, ctx_span, trace_id,
                                              parsed_content ? parsed_content : "",
                                              parsed_reasoning, &parsed_calls);
