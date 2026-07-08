@@ -10252,24 +10252,20 @@ static void generate_job(server *s, job *j) {
                        API_ANTHROPIC);
         return;
     } else if (cached == 0) {
-        if (common == old_pos && j->req.prompt.len >= old_pos) {
-            cached = common;
-        } else if (common > 0 && common < old_pos) {
-            /* The live checkpoint diverges from the new prompt at `common`.
-             * This is usually not a real conversation branch: it is a
-             * mid-generation interrupt (client disconnect, SSE write
-             * failure, cancelled tool call) that left tokens committed to
-             * the live KV cache that the client never received and cannot
-             * replay.  Those trailing tokens are a dead end -- no future
-             * request will ever contain them.  Rewinding to the shared
-             * prefix discards only that dead tail and lets sync evaluate
-             * just the prompt's new suffix, instead of falling through to
-             * a much older/shorter disk snapshot or a full cold prefill.
-             * This subsumes the exact "prompt is a prefix of live" case
-             * (common == prompt.len < old_pos). */
-            ds4_session_rewind(s->session, common);
-            cached = common;
-        }
+        /* NOTE: a prior version of this branch tried to reuse a partial
+         * common prefix (0 < common < old_pos) by calling
+         * ds4_session_rewind() and treating `common` as a cache hit.  That
+         * is unsafe on this backend: the session checkpoint's token count
+         * is not the whole story -- the backend also carries compressed KV
+         * rows, indexer rows, and compressor frontiers that are NOT rewound
+         * by truncating the token count (see the comment above
+         * ds4_session_rewrite_requires_rebuild() in ds4.c).  Reusing a live
+         * session behind its true frontier silently corrupts attention for
+         * every subsequent token, which surfaced as the model derailing
+         * mid-generation.  Only an exact extension (common == old_pos) may
+         * reuse the live session in place; any other mismatch must fall
+         * through to a disk checkpoint or a full replay below. */
+        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
     if (cached == 0) {
