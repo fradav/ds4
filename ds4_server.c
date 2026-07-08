@@ -10252,7 +10252,24 @@ static void generate_job(server *s, job *j) {
                        API_ANTHROPIC);
         return;
     } else if (cached == 0) {
-        cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
+        if (common == old_pos && j->req.prompt.len >= old_pos) {
+            cached = common;
+        } else if (common > 0 && common < old_pos) {
+            /* The live checkpoint diverges from the new prompt at `common`.
+             * This is usually not a real conversation branch: it is a
+             * mid-generation interrupt (client disconnect, SSE write
+             * failure, cancelled tool call) that left tokens committed to
+             * the live KV cache that the client never received and cannot
+             * replay.  Those trailing tokens are a dead end -- no future
+             * request will ever contain them.  Rewinding to the shared
+             * prefix discards only that dead tail and lets sync evaluate
+             * just the prompt's new suffix, instead of falling through to
+             * a much older/shorter disk snapshot or a full cold prefill.
+             * This subsumes the exact "prompt is a prefix of live" case
+             * (common == prompt.len < old_pos). */
+            ds4_session_rewind(s->session, common);
+            cached = common;
+        }
         cache_source = cached > 0 ? "memory-token" : "none";
     }
     if (cached == 0) {
