@@ -506,6 +506,16 @@ static bool kv_cache_incoming_supersedes_continued(
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
     if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    /* A DS4_KVSTORE_REASON_EVICT store means the live session is about to be
+     * replaced -- the caller already found a token mismatch against the
+     * incoming request and is about to search disk for a better base.  Unlike
+     * a normal continued/cold waypoint, this store is not a forward-looking
+     * checkpoint of an ongoing session: a future request landing between this
+     * entry's length and `e`'s length can only be served by `e` (loading is
+     * all-or-nothing, so the longer entry cannot stand in for a shorter
+     * prefix match).  Treating `e` as redundant here would delete the only
+     * checkpoint able to serve the very lookup this store precedes. */
+    if (incoming->reason == DS4_KVSTORE_REASON_EVICT) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -1071,6 +1081,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 

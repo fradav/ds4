@@ -86,6 +86,11 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    /* Reason this checkpoint is being written (ds4_kvstore_reason).  An
+     * DS4_KVSTORE_REASON_EVICT store is a defensive snapshot of a session
+     * about to be replaced (a mismatch was already detected), not a new
+     * forward waypoint -- see the comment on kv_cache_incoming_supersedes_continued. */
+    uint8_t reason;
 } ds4_kvstore_eviction_context;
 
 typedef struct {
