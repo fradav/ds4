@@ -11564,6 +11564,16 @@ static void slot_complete(server *s, server_slot *sl) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* True when some slot other than sl has a job attached or queued jobs exist.
+ * Used to request yields so the worker can interleave slots. */
+static bool sched_other_pending(server *s, server_slot *sl) {
+    for (int i = 0; i < s->n_slots; i++) {
+        server_slot *os = &s->slots[i];
+        if (os != sl && os->job) return true;
+    }
+    return s->head != NULL;
+}
+
 /* Run one scheduling turn for a slot: a whole phase transition, one prefill
  * slice, or up to sched_decode_tokens decode steps. */
 static void slot_step(server *s, server_slot *sl) {
@@ -11603,6 +11613,10 @@ static void slot_step(server *s, server_slot *sl) {
         sl->phase = SLOT_DECODE;
         break;
     case SLOT_DECODE: {
+        /* Yield after this burst if other slots or queued jobs are waiting,
+         * so the worker can attach them and interleave. */
+        if (sched_other_pending(s, sl) || s->queue_depth > 0)
+            sl->yield_requested = true;
         int budget = s->sched_decode_tokens > 0 ? s->sched_decode_tokens : 1;
         bool more = true;
         while (budget-- > 0 && (more = job_decode_step(s, j, gs))) {
@@ -11621,13 +11635,6 @@ static void slot_step(server *s, server_slot *sl) {
     }
     sl->kv_continued_last_store_tokens = s->kv.continued_last_store_tokens;
     s->active = NULL;
-}
-
-static bool sched_any_runnable(server *s) {
-    for (int i = 0; i < s->n_slots; i++) {
-        if (s->slots[i].job) return true;
-    }
-    return false;
 }
 
 /* Round-robin over slots with work: pick the one that ran longest ago. */
@@ -11695,72 +11702,83 @@ static bool enqueue(server *s, job *j) {
     return ENQUEUE_OK;
 }
 
-static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
-        pthread_mutex_unlock(&s->mu);
-        return NULL;
-    }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    if (s->queue_depth > 0) s->queue_depth--;
-    pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
-    return j;
-}
-
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        if (client_socket_gone(j->fd)) {
-            /* The client gave up while this request sat in the queue (agent
-             * timeout + retry is the common case).  Skip it instead of
-             * spending minutes of prefill and decode on a dead socket. */
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: dropping queued request: client disconnected");
-            pthread_mutex_lock(&s->mu);
-            s->stats.queue_dropped_disconnected++;
-            pthread_mutex_unlock(&s->mu);
-        } else {
-            pthread_mutex_lock(&s->mu);
-            s->busy = true;
+        /* --- Attach queued jobs to idle slots (under lock). --- */
+        job *j = NULL;
+        pthread_mutex_lock(&s->mu);
+        if (s->head) {
+            j = s->head;
+            s->head = j->next;
+            if (!s->head) s->tail = NULL;
+            if (s->queue_depth > 0) s->queue_depth--;
+            j->next = NULL;
+        }
+        if (j && !client_socket_gone(j->fd)) {
             s->stats.requests++;
-            /* Attach this job to an idle slot. */
             server_slot *sl = sched_pick_idle_slot(s, j);
             if (sl) {
                 slot_attach(s, sl, j);
+                j = NULL;
             } else {
-                /* No idle slot; queue it back (should not happen with parallel=1). */
+                /* No idle slot; re-queue. */
                 if (s->tail) s->tail->next = j; else s->head = j;
                 s->tail = j;
                 s->queue_depth++;
+                j = NULL;
             }
-            /* Hand queued jobs to idle slots (affinity first, then LRU). */
+            /* Hand remaining queued jobs to idle slots. */
             while (s->head) {
                 server_slot *sl2 = sched_pick_idle_slot(s, s->head);
                 if (!sl2) break;
                 job *j2 = s->head;
                 s->head = j2->next;
                 if (!s->head) s->tail = NULL;
+                if (s->queue_depth > 0) s->queue_depth--;
                 j2->next = NULL;
                 slot_attach(s, sl2, j2);
             }
-            pthread_mutex_unlock(&s->mu);
-            /* Run all active slots until they drain.  slot_complete() signals
-             * each job's done condition when its slot reaches SLOT_IDLE. */
-            for (;;) {
-                server_slot *sl3 = sched_next_slot(s);
-                if (!sl3) break;
-                slot_step(s, sl3);
-            }
-            pthread_mutex_lock(&s->mu);
-            s->busy = false;
-            pthread_mutex_unlock(&s->mu);
         }
+        const bool has_active = sched_next_slot(s) != NULL;
+        const bool has_queue = s->head != NULL;
+        s->busy = has_active || has_queue;
+        pthread_mutex_unlock(&s->mu);
+
+        /* Drop disconnected client (outside lock, signals j->done). */
+        if (j) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: dropping queued request: client disconnected");
+            pthread_mutex_lock(&s->mu);
+            s->stats.queue_dropped_disconnected++;
+            pthread_mutex_unlock(&s->mu);
+            pthread_mutex_lock(&j->mu);
+            j->done = true;
+            pthread_cond_signal(&j->cv);
+            pthread_mutex_unlock(&j->mu);
+        }
+
+        /* --- Step one active slot (unlocked, allows interleaving). --- */
+        server_slot *sl3 = sched_next_slot(s);
+        if (sl3) {
+            slot_step(s, sl3);
+            continue;
+        }
+
+        /* No active slots.  Block on queue, or exit if stopping. */
+        pthread_mutex_lock(&s->mu);
+        if (s->stopping && !s->head) {
+            pthread_mutex_unlock(&s->mu);
+            break;
+        }
+        /* Inline dequeue: wait for work under lock, then pop. */
+        while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+        if (s->stopping && !s->head) {
+            pthread_mutex_unlock(&s->mu);
+            break;
+        }
+        pthread_mutex_unlock(&s->mu);
+        /* Loop back to attach the newly-queued job. */
     }
     return NULL;
 }
