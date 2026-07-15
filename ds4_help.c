@@ -159,6 +159,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+        opt(fp, c, "--parallel N", "Serve up to N requests concurrently by interleaving N sessions on the graph worker. Requires resident experts. Default: 1");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
@@ -559,3 +560,4 @@ void ds4_help_print(FILE *fp, ds4_help_tool tool, const char *topic) {
     }
     print_examples(fp, &c, tool, topic);
 }
+

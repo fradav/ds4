@@ -1871,10 +1871,15 @@ static void test_think_tool_recovery(void) {
         "list_files tool right away.\n\n" DS4_TOOL_CALLS_START;
     buf_append(&forced, body, strlen(body));
 
+    server_slot sl;
+    memset(&sl, 0, sizeof(sl));
     server srv;
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
-    srv.session = session;
+    srv.slots = &sl;
+    srv.n_slots = 1;
+    srv.active = &sl;
+    sl.session = session;
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza
