@@ -9167,16 +9167,54 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
+    char *mismatch_diag = NULL;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = s->active->thinking_live.valid &&
-              s->active->thinking_live.live_tokens == live_pos &&
+    const bool frontier_matches = s->active->thinking_live.valid &&
+                                  s->active->thinking_live.live_tokens == live_pos;
+    bool ok = frontier_matches &&
               s->active->thinking_live.visible_text &&
               s->active->thinking_live.visible_len < prompt_len &&
               byte_prefix_match(req->prompt_text, prompt_len,
                                 s->active->thinking_live.visible_text,
                                 s->active->thinking_live.visible_len);
-    if (ok) visible_len = s->active->thinking_live.visible_len;
+    if (ok) {
+        visible_len = s->active->thinking_live.visible_len;
+    } else if (frontier_matches && s->active->thinking_live.visible_text) {
+        /* The live frontier position lines up (same session, same token
+         * count) but the predicted visible text does not prefix-match this
+         * request's actual rendering.  A bare "reason=token-mismatch" log
+         * gives no way to tell whether that is a canonicalization bug (e.g.
+         * a tool's arguments re-serializing differently than predicted) or
+         * something else, so capture the first differing byte with context
+         * whenever this specific, more diagnosable case occurs. */
+        const char *remembered = s->active->thinking_live.visible_text;
+        const size_t remembered_len = s->active->thinking_live.visible_len;
+        const size_t cmp_len = remembered_len < prompt_len ? remembered_len : prompt_len;
+        size_t diff = 0;
+        while (diff < cmp_len && remembered[diff] == req->prompt_text[diff]) diff++;
+        const size_t ctx_start = diff > 40 ? diff - 40 : 0;
+        char before[96] = {0}, remembered_after[96] = {0}, prompt_after[96] = {0};
+        snprintf(before, sizeof(before), "%.*s",
+                 (int)(diff - ctx_start), remembered + ctx_start);
+        const size_t remembered_tail = remembered_len - diff;
+        snprintf(remembered_after, sizeof(remembered_after), "%.*s",
+                 (int)(remembered_tail < 60 ? remembered_tail : 60), remembered + diff);
+        const size_t prompt_tail = prompt_len - diff;
+        snprintf(prompt_after, sizeof(prompt_after), "%.*s",
+                 (int)(prompt_tail < 60 ? prompt_tail : 60), req->prompt_text + diff);
+        mismatch_diag = xmalloc(512);
+        snprintf(mismatch_diag, 512,
+                 "remembered_len=%zu prompt_len=%zu diverge_at=%zu before=\"%s\" "
+                 "remembered_after=\"%s\" prompt_after=\"%s\"",
+                 remembered_len, prompt_len, diff, before, remembered_after, prompt_after);
+    }
     pthread_mutex_unlock(&s->tool_mu);
+    if (mismatch_diag) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: thinking-live visible text mismatch live=%d %s",
+                   live_pos, mismatch_diag);
+        free(mismatch_diag);
+    }
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(s->active->session);
