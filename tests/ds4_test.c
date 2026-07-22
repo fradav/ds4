@@ -6291,9 +6291,15 @@ static void test_think_tool_recovery(void) {
     buf_append(&forced, body, strlen(body));
 
     server srv;
+    server_slot slot;
     memset(&srv, 0, sizeof(srv));
+    memset(&slot, 0, sizeof(slot));
     srv.engine = engine;
-    srv.session = session;
+    srv.slots = &slot;
+    srv.n_slots = 1;
+    srv.active = &slot;
+    slot.session = session;
+    slot.srv = &srv;
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza

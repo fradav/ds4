@@ -10679,10 +10679,13 @@ static int job_prefill(server *s, job *j, gen_state *gs) {
                                                       gs->cold_store_len);
                 kv_cache_discard_failed_disk_entry(s, gs->disk_cache_path);
                 free(gs->disk_cache_path);
+                const char *err_msg = gs->err[0] ? gs->err :
+                    (g_stop_requested ? "shutdown" : "client-gone");
                 server_log(DS4_LOG_PREFILL,
                            "ds4-server: prefill cancelled ctx=%s reason=%s",
-                           gs->ctx_span, g_stop_requested ? "shutdown" : "client-gone");
-                trace_event(s, gs->trace_id, "prefill cancelled");
+                           gs->ctx_span, err_msg);
+                trace_event(s, gs->trace_id, "prefill failed: %s", err_msg);
+                send_prefill_failure_response(s, j, &gs->progress, gs->ctx_span, gs->req_flags, err_msg);
                 return JOB_PREFILL_FAILED;
             }
             if (kv_cache_store_live_prefix(s, gs->prompt_for_sync, gs->cold_store_len, "cold")) {
@@ -10715,10 +10718,13 @@ static int job_prefill(server *s, job *j, gen_state *gs) {
                                               gs->cold_store_len);
         kv_cache_discard_failed_disk_entry(s, gs->disk_cache_path);
         free(gs->disk_cache_path);
+        const char *err_msg = gs->err[0] ? gs->err :
+            (g_stop_requested ? "shutdown" : "client-gone");
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: prefill cancelled ctx=%s reason=%s",
-                   gs->ctx_span, g_stop_requested ? "shutdown" : "client-gone");
-        trace_event(s, gs->trace_id, "prefill cancelled");
+                   gs->ctx_span, err_msg);
+        trace_event(s, gs->trace_id, "prefill failed: %s", err_msg);
+        send_prefill_failure_response(s, j, &gs->progress, gs->ctx_span, gs->req_flags, err_msg);
         return JOB_PREFILL_FAILED;
     }
     return JOB_PREFILL_DONE;
