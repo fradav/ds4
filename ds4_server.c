@@ -7845,6 +7845,12 @@ struct server {
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool batched_mode;
+    pthread_mutex_t *slot_threads;
+    pthread_mutex_t kv_mu;
+    pthread_mutex_t inference_mu;
+    pthread_mutex_t model_mu;
+    pthread_cond_t model_cv;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -9682,7 +9688,11 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  *
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
+static int server_eval_token(server *s, server_slot *slot, int token,
+                             char *err, size_t errlen);
+
 static int chat_think_tool_recovery(server *s,
+                                    server_slot *slot,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
@@ -11032,7 +11042,7 @@ static bool job_decode_step(server *s, job *j, gen_state *gs) {
                      * close so the model restarts the call on the executable
                      * side. */
                     const int recovered = gs->think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, &gs->text, &gs->thinking,
+                        chat_think_tool_recovery(s, s->active, &gs->text, &gs->thinking,
                                                  &gs->think_recovery_scan_from,
                                                  &gs->completion, gs->max_tokens,
                                                  gs->err, sizeof(gs->err)) : 0;
@@ -12693,6 +12703,40 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.slots = xmalloc((size_t)s.n_slots * sizeof(*s.slots));
+    memset(s.slots, 0, (size_t)s.n_slots * sizeof(*s.slots));
+    if (s.batched_mode) {
+        s.slot_threads = xmalloc((size_t)s.n_slots * sizeof(*s.slot_threads));
+        memset(s.slot_threads, 0, (size_t)s.n_slots * sizeof(*s.slot_threads));
+    }
+
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    pthread_cond_init(&s.clients_cv, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_mutex_init(&s.kv_mu, NULL);
+    pthread_mutexattr_t inference_attr;
+    pthread_mutexattr_init(&inference_attr);
+    pthread_mutexattr_settype(&inference_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.inference_mu, &inference_attr);
+    pthread_mutexattr_destroy(&inference_attr);
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+    pthread_mutex_init(&s.trace_mu, NULL);
+
+    for (int i = 0; i < s.n_slots; i++) {
+        server_slot *slot = &s.slots[i];
+        slot->srv = &s;
+        slot->id = i;
+        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create %s session %d/%d",
+                       ds4_backend_name(cfg.engine.backend), i + 1, s.n_slots);
+            server_close_resources(&s);
+            return 1;
+        }
+    }
+
     s.max_queue = cfg.max_queue;
     s.started_at = now_sec();
     if (cfg.kv_disk_dir) {
