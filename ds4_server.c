@@ -12724,19 +12724,6 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
 
-    for (int i = 0; i < s.n_slots; i++) {
-        server_slot *slot = &s.slots[i];
-        slot->srv = &s;
-        slot->id = i;
-        if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: failed to create %s session %d/%d",
-                       ds4_backend_name(cfg.engine.backend), i + 1, s.n_slots);
-            server_close_resources(&s);
-            return 1;
-        }
-    }
-
     s.max_queue = cfg.max_queue;
     s.started_at = now_sec();
     if (cfg.kv_disk_dir) {
