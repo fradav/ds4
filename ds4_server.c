@@ -12703,12 +12703,6 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
-    s.slots = xmalloc((size_t)s.n_slots * sizeof(*s.slots));
-    memset(s.slots, 0, (size_t)s.n_slots * sizeof(*s.slots));
-    if (s.batched_mode) {
-        s.slot_threads = xmalloc((size_t)s.n_slots * sizeof(*s.slot_threads));
-        memset(s.slot_threads, 0, (size_t)s.n_slots * sizeof(*s.slot_threads));
-    }
 
     pthread_mutex_init(&s.mu, NULL);
     pthread_cond_init(&s.cv, NULL);
