@@ -4478,9 +4478,11 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
-static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
-                                       char **content_out, char **reasoning_out,
-                                       tool_calls *calls) {
+static bool parse_deepseek_generated_message_ex(const char *text,
+                                                bool require_thinking_closed,
+                                                char **content_out,
+                                                char **reasoning_out,
+                                                tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
 
@@ -4496,7 +4498,7 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         if (!think_end) {
             /* Model did not close thinking, ignore any DSML in reasoning */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
             return true;
         }
         tool_search = think_end + 8;
@@ -4662,6 +4664,13 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 }
 
+static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
+                                       char **content_out, char **reasoning_out,
+                                       tool_calls *calls) {
+    return parse_deepseek_generated_message_ex(text, require_thinking_closed,
+                                               content_out, reasoning_out,
+                                               calls);
+}
 /* Try to repair a truncated DSML block.
  *
  * DSML nesting order is: tool_calls > invoke > parameter.
