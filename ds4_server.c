@@ -4497,6 +4497,20 @@ static void ds4_local_unterminated_reasoning(const char *text,
     free(s);
 }
 
+static void ds4_unterminated_reasoning_before_tool(const char *text,
+                                                   size_t prefix_len,
+                                                   char **content_out,
+                                                   char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (prefix_len > strlen(body)) prefix_len = strlen(body);
+    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
+        body += 7;
+        prefix_len -= 7;
+    }
+    *reasoning_out = xstrndup(body, prefix_len);
+    *content_out = xstrdup("");
+}
+
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
                                                 char **content_out,
@@ -4504,6 +4518,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
                                                 tool_calls *calls) {
     text = text ? text : "";
     const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
 
     /* When thinking mode is enabled the model is expected to close
      * </think> before it enters the executable assistant surface.  DSML inside
@@ -4515,12 +4530,17 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            /* Model did not close thinking, ignore any DSML in reasoning */
-            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
-            return true;
+            const char *candidate = find_any_tool_start(text);
+            if (!candidate || !find_any_tool_end(candidate)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete DSML in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
         }
-        tool_search = think_end + 8;
     }
 
     const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
@@ -4585,7 +4605,12 @@ static bool parse_deepseek_generated_message_ex(const char *text,
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_dsml);
             calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
-            split_reasoning_content(text, content_len, content_out, reasoning_out);
+            if (recovered_unclosed_tool) {
+                ds4_unterminated_reasoning_before_tool(text, content_len,
+                                                       content_out, reasoning_out);
+            } else {
+                split_reasoning_content(text, content_len, content_out, reasoning_out);
+            }
             return true;
         }
         if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
@@ -4681,6 +4706,11 @@ static bool parse_deepseek_generated_message_ex(const char *text,
         tool_calls_push(calls, tc);
         buf_free(&args);
     }
+}
+
+static void trim_const_span(const char **start, const char **end) {
+    while (*start < *end && isspace((unsigned char)**start)) (*start)++;
+    while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
 }
 
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
@@ -5965,8 +5995,16 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -5982,6 +6020,14 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                   limit - st->emit_pos)) return false;
             st->sent_reasoning = true;
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close) {
@@ -6662,8 +6708,16 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -6691,6 +6745,14 @@ static bool responses_sse_stream_update(int fd, const request *r,
                 st->reasoning_emitted_any = true;
             }
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close) {
@@ -7539,8 +7601,16 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -7557,6 +7627,15 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                                           limit - st->emit_pos)) return false;
             st->sent_thinking = true;
             st->emit_pos = limit;
+        }
+
+        if (tool_before_close) {
+            if (complete_tool) {
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = ANTH_STREAM_SUPPRESS;
+            }
+            return true;
         }
 
         if (close || final) {
@@ -9694,29 +9773,23 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
-/* Live recovery for a tool call started inside an unclosed <think> block.
- *
- * The model sometimes opens a DSML stanza without closing its thinking first.
- * Waiting for a </think> that never comes stalls the turn: the marker is never
- * scanned as executable and the block is dropped at parse time.  Instead of
- * rewriting sampled context, recover forward: force-feed "</think>" plus a
- * blank line and let the model continue.  Measured on the real model, that
- * position predicts a fresh stanza opening so strongly that the model
- * restarts the call cleanly on the executable side of the close.  Re-emitting
- * the stanza opening ourselves was tried and is counterproductive: with the
- * dangling opening right before the close and a forced copy right after it,
- * the model reads the call as already made and ends the turn.  The dangling
- * opening stays harmlessly inside reasoning.
- *
- * Detection works on accumulated text, so the tokenization of the marker does
- * not matter, and it triggers only on a complete stanza opening: a lone "<"
- * or a partial marker keeps decoding untouched, while *scan_from holds back
- * far enough that an opening split across future tokens is still seen from
- * its first byte.  The forced text is tokenized with the rendered-chat
- * tokenizer so </think> maps to its special token.
- *
- * Returns 1 when an injection was performed (text extended, thinking closed),
- * 0 when there is nothing to do or no budget, -1 on eval failure. */
+/* A completed tool block inside unclosed reasoning can be recovered without
+ * predicting what the model will emit after an injected close marker. Keep a
+ * short overlap until the opening appears, then wait for its matching end. */
+static bool complete_tool_call_inside_thinking(const char *text, size_t len,
+                                               size_t *scan_from) {
+    if (!text || !scan_from) return false;
+    if (*scan_from > len) *scan_from = len;
+    const char *start = find_any_tool_start(text + *scan_from);
+    if (!start) {
+        const size_t hold = 80;
+        *scan_from = len > hold ? len - hold : 0;
+        return false;
+    }
+    *scan_from = (size_t)(start - text);
+    return find_any_tool_end(start) != NULL;
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen);
 
@@ -9767,7 +9840,6 @@ static int chat_think_tool_recovery(server *s,
     ds4_tokens_free(&toks);
     return 1;
 }
-
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
     const char *p = prompt_text;
@@ -11078,9 +11150,6 @@ static bool job_decode_step(server *s, job *j, gen_state *gs) {
                     if (recovered < 0) {
                         gs->finish = "error";
                         stop_decode = true;
-                        break;
-                    }
-                    if (recovered) {
                         server_log(DS4_LOG_WARNING,
                                    "ds4-server: chat ctx=%s%s%s tool call inside unclosed <think>; "
                                    "forced </think> after %d generated tokens",
