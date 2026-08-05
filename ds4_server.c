@@ -4479,6 +4479,20 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* Handle unterminated reasoning: treat entire text as reasoning content.
+ * Used when the model did not close its thinking tag. */
+static void ds4_local_unterminated_reasoning(const char *text,
+                                             char **content_out,
+                                             char **reasoning_out) {
+    char *s = xstrndup(text ? text : "", strlen(text ? text : ""));
+    char *body = s;
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    /* No closing tag found, treat all as reasoning */
+    *reasoning_out = xstrdup(body);
+    *content_out = xstrdup("");
+    free(s);
+}
+
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
                                                 char **content_out,
