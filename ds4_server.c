@@ -2442,9 +2442,6 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-}
-}
-
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
