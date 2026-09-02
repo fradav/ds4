@@ -12164,9 +12164,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d images=%zu check_imgs=%zu vision=%s reason=%s",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
+                   j->req.image_count,
+                   ds4_session_vision_checkpoint_count(slot->session),
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
     }

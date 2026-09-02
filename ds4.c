@@ -66689,13 +66689,20 @@ bool ds4_session_vision_state_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
+    /* The live cache stays reusable while the retained images remain a
+     * prefix of the request.  Images appended past the cached frontier are
+     * added by the next prefill; demanding exact-count equality here would
+     * throw away the whole cache on every image-bearing tool result. */
     return s && s->checkpoint_valid &&
-           s->checkpoint_image_count == image_count &&
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
+}
+
+size_t ds4_session_vision_checkpoint_count(const ds4_session *s) {
+    return s ? s->checkpoint_image_count : 0;
 }
 
 static bool ds4_session_vision_range_overlaps(

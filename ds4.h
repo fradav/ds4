@@ -428,11 +428,14 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
-/* Return true only when every image that conditioned the live checkpoint has
- * the same token span and embedding fingerprint in the supplied prompt. */
+/* True when the images that conditioned the live checkpoint appear unchanged
+ * as a prefix of the supplied prompt, so the session may continue from the
+ * live KV and add any images past the cached frontier with the next prefill. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Number of image identities retained at the live checkpoint (0 if none). */
+size_t ds4_session_vision_checkpoint_count(const ds4_session *s);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
