@@ -11393,7 +11393,12 @@ static int server_decode_budget(int requested, int generated, int room) {
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    /* GLM keeps its thinking-tag syntax in history (toolless renders always
+     * preserve the ' THINKING' tag) so a meaningful visible checkpoint is
+     * never armed for it.  Everything else can still reach the final-answer
+     * path with tools in the conversation and may use the generic line. */
+    if (r->has_tools && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) return false;
     if (r->prompt_preserves_reasoning) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -11610,16 +11615,52 @@ static char *build_toolless_thinking_visible_text(const request *r,
 
     buf visible = {0};
     buf_append(&visible, r->prompt_text, pt_len - tag_len);
-    buf_puts(&visible, "</think>");
+    buf_puts(&visible, "\x3c/think\x3e");
     buf_puts(&visible, content ? content : "");
-    buf_puts(&visible, "<｜end▁of▁sentence｜>");
+    /* the renderer ends an assistant turn with the DSML EOS token, so the
+     * remembered visible key must reproduce those bytes to match the next
+     * prompt (test_thinking_checkpoint_canonical_matches_future_prompt) */
+    buf_puts(&visible, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
+                      "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+    return buf_take(&visible);
+}
+
+/* Same idea as build_toolless_thinking_visible_text(), for the tool_context
+ * case.  Chat history with any tool schema always renders every historical
+ * assistant turn through the " thinking{reasoning} response" branch in
+ * render_deepseek_chat_prompt_text(), never the bare " response" branch.  A
+ * client that does not replay reasoning_content (most OpenAI-compatible
+ * agents) re-renders that turn as literally " thinking response", so the
+ * remembered key must keep the opening " thinking" tag -- the toolless helper
+ * above strips it. */
+static char *build_tool_context_thinking_visible_text(const request *r,
+                                                      const char *content) {
+    if (!r || !r->prompt_text) return NULL;
+    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+
+    size_t pt_len = strlen(r->prompt_text);
+    const char *think_tag = " thinking";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return NULL;
+    }
+
+    buf visible = {0};
+    buf_append(&visible, r->prompt_text, pt_len);
+    buf_puts(&visible, "\x3c/think\x3e");
+    buf_puts(&visible, content ? content : "");
+    buf_puts(&visible, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
+                      "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
     return buf_take(&visible);
 }
 
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content) {
-    char *visible = build_toolless_thinking_visible_text(&j->req, content);
+    char *visible = j->req.has_tools
+                        ? build_tool_context_thinking_visible_text(&j->req, content)
+                        : build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
     thinking_live_remember(s, slot, visible);
@@ -11809,6 +11850,48 @@ done:
     ds4_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
+}
+
+/* After a tool-call finish in the Chat protocol, a client that replays this
+ * turn via structured tool_calls (rather than raw DSML text) decides itself
+ * what reasoning_content to echo back next time -- empty for most
+ * OpenAI-compatible agents.  chat_history_uses_tool_context() then renders
+ * that historical turn as " thinking response{content}{tool_calls}", never
+ * the real sampled reasoning, so remember that exact shape as a visible key
+ * (this mirrors remember_thinking_checkpoint()'s toolless case).  A client
+ * that *does* replay sampled reasoning still gets an ordinary token-prefix
+ * hit before this fallback is ever consulted, so this is purely additive.
+ * GLM is left alone for the same reason as should_remember_thinking_checkpoint(). */
+static void remember_tool_thinking_checkpoint(server *s, server_slot *slot,
+                                              const job *j, const char *ctx,
+                                              uint64_t trace_id,
+                                              const char *content,
+                                              const tool_calls *calls) {
+    if (j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM || !j->req.prompt_text) {
+        thinking_live_clear(s, slot);
+        return;
+    }
+
+    char *suffix = build_tool_checkpoint_suffix(&j->req, content, NULL, calls);
+    buf visible = {0};
+    buf_puts(&visible, j->req.prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    if (!visible.len) {
+        thinking_live_clear(s, slot);
+        buf_free(&visible);
+        free(suffix);
+        return;
+    }
+
+    thinking_live_remember(s, slot, visible.ptr);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: tool thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
+               ctx, ds4_session_pos(slot->session), visible.len);
+    trace_event(s, trace_id,
+                "tool thinking live checkpoint remembered: live=%d visible=%zu",
+                ds4_session_pos(slot->session), visible.len);
+    buf_free(&visible);
+    free(suffix);
 }
 
 static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
@@ -13161,9 +13244,13 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
+        remember_tool_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
+                                          parsed_content ? parsed_content : "",
+                                          &parsed_calls);
     } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
+        remember_tool_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
+                                          parsed_content ? parsed_content : "",
+                                          &parsed_calls);
     } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
@@ -18593,11 +18680,79 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
+    TEST_ASSERT(r.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK);
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
+    request_free(&r);
+}
+
+static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup("past history thinking");
+
+    char *visible = build_tool_context_thinking_visible_text(&r, "answer");
+    TEST_ASSERT(visible);
+    TEST_ASSERT(strstr(visible, " thinking") != NULL);
+    TEST_ASSERT(strstr(visible, "\x3c/think\x3e") != NULL);
+    TEST_ASSERT(strstr(visible, "answer") != NULL);
+    const char *eos = "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
+                          "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">";
+    size_t vlen = strlen(visible), elen = strlen(eos);
+    TEST_ASSERT(vlen >= elen);
+    TEST_ASSERT(!memcmp(visible + vlen - elen, eos, elen));
+    free(visible);
+
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(build_tool_context_thinking_visible_text(&r, "answer") == NULL);
+
+    r.think_mode = DS4_THINK_HIGH;
+    free(r.prompt_text);
+    r.prompt_text = xstrdup("no trailing tag");
+    TEST_ASSERT(build_tool_context_thinking_visible_text(&r, "answer") == NULL);
+
+    request_free(&r);
+}
+
+static void test_tool_checkpoint_suffix_omits_reasoning(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+
+    tool_call calls[1];
+    calls[0].id = xstrdup("call_123");
+    calls[0].name = xstrdup("get_weather");
+    calls[0].arguments = xstrdup("{}");
+    tool_calls tc = {.v = calls, .len = 1};
+
+    char *suffix = build_tool_checkpoint_suffix(&r, "content", NULL, &tc);
+    const char *eos = "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
+                          "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">";
+    TEST_ASSERT(suffix);
+    /* canonical tool checkpoint shape:  response + content + DSML + EOS */
+    TEST_ASSERT(!strncmp(suffix, "\x3c/think\x3e", 8));
+    TEST_ASSERT(strstr(suffix, "content") != NULL);
+    TEST_ASSERT(strstr(suffix, "get_weather") != NULL);
+    TEST_ASSERT(strstr(suffix, "invoke name=\"get_weather\"") != NULL);
+    size_t slen = strlen(suffix), elen = strlen(eos);
+    TEST_ASSERT(slen >= elen);
+    TEST_ASSERT(!memcmp(suffix + slen - elen, eos, elen));
+    TEST_ASSERT(strstr(suffix, "call_123") == NULL);
+    TEST_ASSERT(strstr(suffix, " DSML_END") == NULL);
+    TEST_ASSERT(strstr(suffix, " thinking") == NULL);
+    free(suffix);
+
+    free(calls[0].id);
+    free(calls[0].name);
+    free(calls[0].arguments);
     request_free(&r);
 }
 
@@ -19901,6 +20056,8 @@ static void ds4_server_unit_tests_run(void) {
     test_cancel_withdraws_only_pending_decode();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_tool_context_thinking_visible_text_keeps_think_tag();
+    test_tool_checkpoint_suffix_omits_reasoning();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
