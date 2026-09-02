@@ -2029,7 +2029,13 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
-        if (msg.images.len && strcmp(msg.role, "user")) goto fail;
+        /* Screenshot-carrying tool results arrive as a role="tool" (or
+         * "function") message whose content includes an image_url block.  Like
+         * user-role images, the marker is embedded in the content and the vision
+         * pipeline renders it in place, so accept those roles here. */
+        if (msg.images.len && strcmp(msg.role, "user") &&
+            strcmp(msg.role, "tool") && strcmp(msg.role, "function"))
+            goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -19741,6 +19747,40 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* Agents attach screenshots to the tool message that reports the capture.
+ * OpenAI chat tool results arrived as role "tool" (or "function") carrying an
+ * image_url data-URI block, which must parse like a user-role image instead of
+ * aborting the whole request. */
+static void test_openai_tool_role_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"tool\",\"tool_call_id\":\"call_a456ffa4d6c3a777404a4fb30f2e0ae8\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"shot \"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "shot ") == msgs.v[0].content);
+    TEST_ASSERT(msgs.v[0].tool_call_ids_len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].tool_call_ids[0], "call_a456ffa4d6c3a777404a4fb30f2e0ae8"));
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    const char *marker = msgs.v[0].images.v[0].marker;
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt);
+    const char *open = strstr(prompt, "<tool_result>");
+    const char *cm = strstr(prompt, marker);
+    const char *close = strstr(prompt, "</tool_result>");
+    TEST_ASSERT(open && cm && close && open < cm && cm < close);
+    free(prompt);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
@@ -19836,6 +19876,7 @@ static void ds4_server_unit_tests_run(void) {
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
+    test_openai_tool_role_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
