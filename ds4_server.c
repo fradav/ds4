@@ -18857,8 +18857,8 @@ static void test_thinking_whitespace_renders_empty(void) {
     /* The padded space must not survive into the rendered tags: the
      * boundary is the clean opening tag immediately followed by the
      * closing one, exactly as the live KV was sampled. */
-    TEST_ASSERT(strstr(prompt, " thinking response") != NULL);
-    TEST_ASSERT(strstr(prompt, " thinking  response") == NULL);
+    TEST_ASSERT(strstr(prompt, "<think></think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<think> </think>") == NULL);
 
     free(prompt);
     chat_msgs_free(&msgs);
