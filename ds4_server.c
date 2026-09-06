@@ -10836,9 +10836,20 @@ static void trace_write_cache_diag(
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+    if (!backend_can_rewind) return -1;
+    /* The request exactly prefixes the live checkpoint but is shorter (retry
+     * after interrupted decode): drop the half-decoded tail and re-evaluate
+     * from the previous token. */
+    if (common == prompt_len && prompt_len > 1 && prompt_len < old_pos) {
+        return prompt_len - 1;
+    }
+    /* The common prefix ends before both the checkpoint and the request (e.g.
+     * a tool result re-encoded the tail): rewind to the last shared token and
+     * re-evaluate only the divergent suffix. */
+    if (common > 1 && common < old_pos && common < prompt_len) {
+        return common - 1;
+    }
+    return -1;
 }
 
 static void trace_time(FILE *fp) {
@@ -12297,7 +12308,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     } else if (cached == 0 && live_vision_match) {
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
+            ds4_engine_rewind_capable(s->engine), old_pos,
             j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
@@ -12315,11 +12326,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 cache_source = "memory-rewind";
                 cache_diag.rewind_to = rewind_to;
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           "ds4-server: rewound live prefix from %d to %d; divergent suffix will be reevaluated",
                            old_pos, rewind_to);
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                           "ds4-server: live prefix rewind from %d to %d requires rebuild",
                            old_pos, rewind_to);
             }
         } else {
@@ -18523,9 +18534,15 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
     TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == 6);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    /* divergent suffix (e.g. re-encoded tool result): rewind to last shared token */
+    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143260, 142520) == 142519);
+    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143251, 142520) == 142519);
+    TEST_ASSERT(live_prefix_rewind_target(false, 143251, 143260, 142520) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 0) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {

@@ -64842,6 +64842,13 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+/* Rewinding the live prefix to the last shared token is an inference-only
+ * mechanism. Keep it off the CPU reference backend, which must stay a plain,
+ * unrewound decoder to remain a faithful correctness baseline. */
+bool ds4_engine_rewind_capable(ds4_engine *e) {
+    return e && e->backend != DS4_BACKEND_CPU;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
