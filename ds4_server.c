@@ -9126,6 +9126,11 @@ typedef struct {
     /* True when this frontier ends in an assistant tool-call turn rather than
      * a final answer; only used to label the cache hit source. */
     bool tool_turn;
+    /* Tool-call ids generated at this frontier, mirroring live_tool_state.
+     * Lets tool_memory_prune_locked() pin their raw DSML bytes in RAM while
+     * this checkpoint is still the one a byte-exact chat/completions replay
+     * will be checked against (see tool_memory_id_pinned). */
+    stop_list call_ids;
 } visible_live_state;
 
 struct server_slot {
@@ -9363,11 +9368,35 @@ static void tool_memory_remove_entry_locked(tool_memory *m, tool_memory_entry *e
     free(e);
 }
 
-static void tool_memory_prune_locked(tool_memory *m) {
+static bool tool_memory_id_pinned(const server *s, const char *id) {
+    if (!s || !id || !id[0]) return false;
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        if (slot->responses_live.valid &&
+            id_list_contains(&slot->responses_live.call_ids, id)) return true;
+        if (slot->anthropic_live.valid &&
+            id_list_contains(&slot->anthropic_live.call_ids, id)) return true;
+        if (slot->thinking_live.valid &&
+            id_list_contains(&slot->thinking_live.call_ids, id)) return true;
+    }
+    return false;
+}
+
+static void tool_memory_prune_locked(const server *s, tool_memory *m) {
+    /* Walk from the LRU tail toward the head, skipping ids that a currently
+     * valid live checkpoint (thinking_live/responses_live/anthropic_live, any
+     * slot) still depends on for a byte-exact replay. Evicting one of those
+     * would silently force the next matching request off the live-KV reuse
+     * path and into a full prefill, even though the exact bytes were sampled
+     * moments ago and are still needed. If everything left is pinned, stop
+     * without forcing eviction; the budget is a soft cap in that case. */
+    tool_memory_entry *e = m->tail;
     while ((m->entries > tool_memory_max_entries(m) ||
-            m->bytes > tool_memory_max_bytes(m)) && m->tail)
+            m->bytes > tool_memory_max_bytes(m)) && e)
     {
-        tool_memory_remove_entry_locked(m, m->tail);
+        tool_memory_entry *prev = e->prev;
+        if (!tool_memory_id_pinned(s, e->id)) tool_memory_remove_entry_locked(m, e);
+        e = prev;
     }
 }
 
@@ -9378,7 +9407,7 @@ static tool_memory_entry *tool_memory_find_entry_locked(tool_memory *m,
     return v == raxNotFound ? NULL : v;
 }
 
-static void tool_memory_put_locked(tool_memory *m, const char *id,
+static void tool_memory_put_locked(const server *s, tool_memory *m, const char *id,
                                    const char *dsml, tool_memory_source source) {
     if (!id || !id[0] || !dsml || !dsml[0]) return;
     tool_memory_init_locked(m);
@@ -9390,7 +9419,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     {
         if (source == TOOL_MEMORY_RAM) old->source = TOOL_MEMORY_RAM;
         tool_memory_touch(m, old);
-        tool_memory_prune_locked(m);
+        tool_memory_prune_locked(s, m);
         return;
     }
     if (old) tool_memory_remove_entry_locked(m, old);
@@ -9417,7 +9446,7 @@ static void tool_memory_put_locked(tool_memory *m, const char *id,
     tool_memory_link_head(m, e);
     m->entries++;
     m->bytes += e->bytes;
-    tool_memory_prune_locked(m);
+    tool_memory_prune_locked(s, m);
 }
 
 static void tool_memory_free(tool_memory *m) {
@@ -9453,6 +9482,7 @@ static void live_tool_state_free(live_tool_state *st) {
 
 static void visible_live_clear_locked(visible_live_state *st) {
     if (!st) return;
+    stop_list_clear(&st->call_ids);
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
@@ -9464,6 +9494,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
 static void visible_live_free(visible_live_state *st) {
     if (!st) return;
     visible_live_clear_locked(st);
+    free(st->call_ids.v);
     memset(st, 0, sizeof(*st));
 }
 
@@ -9476,7 +9507,8 @@ static void thinking_live_clear(server *s, server_slot *slot) {
 
 static void thinking_live_remember(server *s, server_slot *slot,
                                    const char *visible_text,
-                                   bool tool_turn) {
+                                   bool tool_turn,
+                                   const tool_calls *calls) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&slot->thinking_live);
@@ -9484,6 +9516,11 @@ static void thinking_live_remember(server *s, server_slot *slot,
     slot->thinking_live.visible_len = strlen(visible_text);
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.tool_turn = tool_turn;
+    if (calls) {
+        for (int i = 0; i < calls->len; i++) {
+            id_list_push_unique(&slot->thinking_live.call_ids, calls->v[i].id);
+        }
+    }
     slot->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -9617,7 +9654,7 @@ static void tool_memory_remember(server *s, const tool_calls *calls) {
         !calls || !calls->raw_tool_text || !calls->raw_tool_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
-        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_tool_text,
+        tool_memory_put_locked(s, &s->tool_mem, calls->v[i].id, calls->raw_tool_text,
                                TOOL_MEMORY_RAM);
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -9628,7 +9665,7 @@ static void tool_memory_put_source(server *s, const char *id, const char *dsml,
     if (!s || s->disable_exact_dsml_tool_replay ||
         !id || !id[0] || !dsml || !dsml[0]) return;
     pthread_mutex_lock(&s->tool_mu);
-    tool_memory_put_locked(&s->tool_mem, id, dsml, source);
+    tool_memory_put_locked(s, &s->tool_mem, id, dsml, source);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -11783,7 +11820,7 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
                         : build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, slot, visible, false);
+    thinking_live_remember(s, slot, visible, false, NULL);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), strlen(visible));
@@ -11998,7 +12035,7 @@ static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
     buf visible = {0};
     buf_puts(&visible, j->req.prompt_text);
     buf_puts(&visible, suffix ? suffix : "");
-    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", tool_turn);
+    thinking_live_remember(s, slot, visible.ptr ? visible.ptr : "", tool_turn, calls);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session), visible.len);
