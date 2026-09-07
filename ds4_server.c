@@ -10839,15 +10839,14 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
     if (!backend_can_rewind) return -1;
     /* The request exactly prefixes the live checkpoint but is shorter (retry
      * after interrupted decode): drop the half-decoded tail and re-evaluate
-     * from the previous token. */
+     * from the previous token.
+     *
+     * This is the only case where reusing the KV prefix is provably safe: a
+     * merely divergent suffix would roll back to a checkpoint whose physical
+     * KV encodes a different follow-up, so any other partial common prefix
+     * must fall through to a full rebuild. */
     if (common == prompt_len && prompt_len > 1 && prompt_len < old_pos) {
         return prompt_len - 1;
-    }
-    /* The common prefix ends before both the checkpoint and the request (e.g.
-     * a tool result re-encoded the tail): rewind to the last shared token and
-     * re-evaluate only the divergent suffix. */
-    if (common > 1 && common < old_pos && common < prompt_len) {
-        return common - 1;
     }
     return -1;
 }
@@ -12313,26 +12312,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
-            const bool rewind_valid =
-                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                    rewind_to &&
-                (!multimodal ||
-                 ds4_session_vision_state_matches(slot->session,
-                                                  j->req.images,
-                                                  j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
-            if (rewind_valid) {
-                cached = rewind_to;
-                cache_source = "memory-rewind";
-                cache_diag.rewind_to = rewind_to;
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound live prefix from %d to %d; divergent suffix will be reevaluated",
-                           old_pos, rewind_to);
-            } else {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: live prefix rewind from %d to %d requires rebuild",
-                           old_pos, rewind_to);
-            }
+            cached = rewind_to;
+            cache_source = "memory-rewind";
+            cache_diag.rewind_to = rewind_to;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewound live prefix from %d to %d; final prompt token will be re-evaluated",
+                       old_pos, rewind_to);
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
@@ -18534,12 +18520,11 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
     TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == 6);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
-    /* divergent suffix (e.g. re-encoded tool result): rewind to last shared token */
-    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143260, 142520) == 142519);
-    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143251, 142520) == 142519);
+    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143260, 142520) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 143251, 143251, 142520) == -1);
     TEST_ASSERT(live_prefix_rewind_target(false, 143251, 143260, 142520) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 1) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 0) == -1);
