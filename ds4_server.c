@@ -12349,13 +12349,37 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
+            /* ds4_engine_rewind_capable() only excludes the CPU reference
+             * backend; it says nothing about whether this model family can
+             * actually preserve reusable state across a rewind. GLM can roll
+             * back its MTP/dense cache exactly, so the checkpoint stays
+             * valid; DeepSeek's compressor cannot be rolled back by
+             * truncating row counts (see ds4_session_rewind), so the rewind
+             * silently invalidates the checkpoint there. Re-derive the common
+             * prefix (which returns 0 once invalid) instead of trusting
+             * rewind_to blindly, so a DeepSeek session falls through to the
+             * normal disk/full-rebuild path rather than "succeeding" into a
+             * KV state that no longer corresponds to any cached tokens. */
+            const bool rewind_valid =
+                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                    rewind_to &&
+                (!multimodal ||
+                 ds4_session_vision_state_matches(slot->session,
+                                                  j->req.images,
+                                                  j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
-            cached = rewind_to;
-            cache_source = "memory-rewind";
-            cache_diag.rewind_to = rewind_to;
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound live prefix from %d to %d; final prompt token will be re-evaluated",
-                       old_pos, rewind_to);
+            if (rewind_valid) {
+                cached = rewind_to;
+                cache_source = "memory-rewind";
+                cache_diag.rewind_to = rewind_to;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: rewound live prefix from %d to %d; final prompt token will be re-evaluated",
+                           old_pos, rewind_to);
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: live prefix rewind from %d to %d requires rebuild",
+                           old_pos, rewind_to);
+            }
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
