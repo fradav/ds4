@@ -502,6 +502,15 @@ static bool server_image_media_type(const char *media_type) {
             !strcasecmp(media_type, "image/jpg"));
 }
 
+static uint64_t server_image_fnv1a(uint64_t seed, const uint8_t *data, size_t len) {
+    uint64_t h = seed;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
@@ -510,14 +519,23 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
     server_image_input image = {0};
     if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
         return false;
+    /* Derive the marker's hex payload from the image's own encoded bytes
+     * instead of a random nonce. The strstr() lookup in
+     * request_tokenize_multimodal_prompt() only needs this to be a stable,
+     * unique-enough delimiter -- it never decodes the hex back into an
+     * identity. Determinism matters because clients resend the full
+     * message history (including old tool-result images) on every request;
+     * a random nonce made the byte-exact "visible" checkpoint used for live
+     * KV reuse (thinking_live_visible_prefix_prompt) see old images as
+     * changed on every re-parse, forcing an expensive full prompt rebuild
+     * from token zero even though the image content was identical. */
+    uint64_t h1 = server_image_fnv1a(14695981039346656037ULL,
+                                     image.encoded, image.encoded_len);
+    uint64_t h2 = server_image_fnv1a(0xc6a4a7935bd1e995ULL,
+                                     image.encoded, image.encoded_len);
     unsigned char nonce[12];
-    if (!random_bytes(nonce, sizeof(nonce))) {
-        uint64_t fallback = (uint64_t)time(NULL) ^
-                            ((uint64_t)getpid() << 32) ^
-                            (uint64_t)(uintptr_t)images;
-        memcpy(nonce, &fallback, sizeof(fallback));
-        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
-    }
+    memcpy(nonce, &h1, 8);
+    memcpy(nonce + 8, &h2, 4);
     static const char hex[] = "0123456789abcdef";
     size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
                                   "\036" "DS4_IMAGE_");
