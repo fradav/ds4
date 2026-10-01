@@ -16319,6 +16319,24 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
 }
 
+static void test_max_request_images_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.max_request_images == 16);
+
+    char *custom_argv[] = {
+        "ds4-server", "--max-request-images", "48"
+    };
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.max_request_images == 48);
+
+    char *unlimited_argv[] = {
+        "ds4-server", "--max-request-images", "0"
+    };
+    server_config unlimited = parse_options(3, unlimited_argv);
+    TEST_ASSERT(unlimited.max_request_images == 0);
+}
+
 /* Reuse-aware slot routing: the probe must recognize every way a request
  * can reuse a slot's live state, and the router must steer requests that can
  * reuse nothing away from resident checkpoints. */
@@ -21601,7 +21619,10 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
     TEST_ASSERT(r.model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK);
-    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    /* Tool-context conversations are checkpointed through the tool-context
+     * path (should_remember_tool_context_checkpoint / the tool-call call
+     * site), so the plain thinking checkpoint intentionally excludes them. */
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
@@ -21655,14 +21676,17 @@ static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
     /* The production visible key for a tool-context DeepSeek turn is
      * prompt_text + build_tool_checkpoint_suffix().  The suffix keeps the
      * rendered think-close/assistant-open tag (" response"), the content,
-     * and the trailing EOS space the next request will render. */
+     * and the trailing DSML end-of-sentence marker the next request will
+     * render. */
     char *suffix = build_tool_checkpoint_suffix(&r, "answer", NULL, NULL);
     TEST_ASSERT(suffix);
     TEST_ASSERT(strstr(suffix, " response") != NULL);
     TEST_ASSERT(strstr(suffix, "answer") != NULL);
-    size_t slen = strlen(suffix);
-    TEST_ASSERT(slen >= 1);
-    TEST_ASSERT(suffix[slen - 1] == ' ');
+    const char *eos = "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
+                          "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">";
+    size_t slen = strlen(suffix), elen = strlen(eos);
+    TEST_ASSERT(slen >= elen);
+    TEST_ASSERT(!memcmp(suffix + slen - elen, eos, elen));
     free(suffix);
 
     /* build_tool_checkpoint_suffix() never returns NULL: THINK_NONE just
@@ -22813,6 +22837,36 @@ static void test_openai_inline_image_content(void) {
     TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
     TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
     TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_openai_tool_role_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"tool\",\"tool_call_id\":\"call_a456ffa4d6c3a777404a4fb30f2e0ae8\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"shot \"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "shot ") == msgs.v[0].content);
+    TEST_ASSERT(msgs.v[0].tool_call_ids_len == 1);
+    TEST_ASSERT(!strcmp(msgs.v[0].tool_call_ids[0], "call_a456ffa4d6c3a777404a4fb30f2e0ae8"));
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    const char *marker = msgs.v[0].images.v[0].marker;
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt);
+    const char *open = strstr(prompt, "<tool_result>");
+    const char *cm = strstr(prompt, marker);
+    const char *close = strstr(prompt, "</tool_result>");
+    TEST_ASSERT(open && cm && close && open < cm && cm < close);
+    free(prompt);
     chat_msgs_free(&msgs);
     buf_free(&json);
 }
