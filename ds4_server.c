@@ -21675,12 +21675,11 @@ static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
 
     /* The production visible key for a tool-context DeepSeek turn is
      * prompt_text + build_tool_checkpoint_suffix().  The suffix keeps the
-     * rendered think-close/assistant-open tag (" response"), the content,
-     * and the trailing DSML end-of-sentence marker the next request will
-     * render. */
+     * rendered think-close tag (</think>), the content, and the trailing
+     * DSML end-of-sentence marker the next request will render. */
     char *suffix = build_tool_checkpoint_suffix(&r, "answer", NULL, NULL);
     TEST_ASSERT(suffix);
-    TEST_ASSERT(strstr(suffix, " response") != NULL);
+    TEST_ASSERT(strstr(suffix, "\x3c/think\x3e") != NULL);
     TEST_ASSERT(strstr(suffix, "answer") != NULL);
     const char *eos = "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of"
                           "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">";
@@ -21696,7 +21695,7 @@ static void test_tool_context_thinking_visible_text_keeps_think_tag(void) {
     char *s2 = build_tool_checkpoint_suffix(&r, "answer", NULL, NULL);
     TEST_ASSERT(s2);
     TEST_ASSERT(strstr(s2, "answer") != NULL);
-    TEST_ASSERT(strstr(s2, " response") == NULL);
+    TEST_ASSERT(strstr(s2, "\x3c/think\x3e") == NULL);
     free(s2);
 
     r.think_mode = DS4_THINK_HIGH;
